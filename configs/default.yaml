@@ -1,0 +1,192 @@
+seed: 42
+output_dir: runs/v2
+
+data:
+  root: data/vaani
+  sr: 16000
+  n_mels: 128
+  hop: 160                    # 10 ms mel frames into the CNN
+  clip_len: 8.0               # window (s). Corpus mean is 5.7 s; v1's 10 s
+                              # window was ~40% zero padding.
+  fps: 25.0                   # base output grid, 40 ms - matches ATST-Frame.
+                              # Boundaries are *regressed*, not thresholded, so
+                              # this grid does not cap boundary precision.
+                              # (A perfect model quantised to 25 fps scores
+                              # 1.988 on this metric; 50 fps buys +0.006.)
+  expand_vehicle: true
+  n_folds: 5                  # state-grouped k-fold. Select on the mean.
+  vad_dir: ""                 # scripts/make_vad.py output; enables the speech head
+
+model:
+  # ---- pretrained encoders, fused ----
+  # Order matters only for readability; all are concatenated after projection.
+  # ATST-Frame is primary: 40 ms tokens against a metric whose 10th-percentile
+  # tolerance is 59 ms. BEATs (160 ms) rides along as a semantic channel.
+  # Drop to [] for the no-encoder ablation.
+  encoders: [atst_frame, beats]
+  atst_ckpt: ""               # default checkpoints/atst_frame.ckpt
+  beats_ckpt: ""              # auto-downloaded if empty
+  beats_dir: checkpoints
+  proj_dim: 256
+  freeze_encoders: true       # staged unfreezing below
+
+  # ---- backbone ----
+  d_model: 384
+  n_levels: 5                 # 40 / 80 / 160 / 320 / 640 ms
+  n_base_layers: 2
+  n_head: 8
+  n_bins: 16                  # boundary distribution bins per level
+  dropout: 0.15               # 0.10 -> 0.15: the 50-epoch run peaked at epoch 15
+                              # (1.1881) and fell to 1.0646 by epoch 50 while the
+                              # train loss halved. That is the regularisation
+                              # budget being 35 epochs short, not a schedule bug.
+  boundary_branch: true       # 20 ms onset/offset head; see BoundaryBranch
+  boundary_mult: 2            # refinement grid = this x the 25 fps detection grid
+  boundary_tap: 1             # CNN block the branch reads. 1 = 50 fps; 0 = the
+                              # log-mel + spectral flux at the full 100 fps
+  dgqp: true                  # GFLv2 quality from the boundary distributions
+  specaug: true
+  flux: true                  # spectral-flux onset channels alongside the mel
+  max_count: 8
+
+train:
+  # Measured, from the 50-epoch fold-0 run: best val 1.1881 at epoch 15, then a
+  # monotone slide to 1.0646 at epoch 50.
+  #
+  # I first read that slide as the epoch-12 encoder unfreeze and moved it late.
+  # The 24-epoch run that followed kept the encoders frozen throughout and slid
+  # anyway - 1.1531 at epoch 12 down to 1.1416 at epoch 24 - so the unfreeze was
+  # not the cause. The cause is that the gold pool is only ~8900 clips and sets
+  # the epoch length, so every epoch is a full pass over it; 18.5M trainable
+  # parameters start memorising it around epoch 12 whatever the encoders do.
+  #
+  # This costs compute, not score: `best.pt` keeps the peak and `eval_every: 2`
+  # is frequent enough to catch it. So the schedule is short by design, and the
+  # budget a longer run would have burned goes to more folds instead - the
+  # ensemble is worth more than the epochs would have been.
+  epochs: 20
+  batch_size: 16              # per GPU under torchrun
+  lr: 0.0005
+  encoder_lr_scale: 0.02      # 0.05 was enough to start the overfit slide
+  weight_decay: 0.05
+  warmup_steps: 800
+  grad_clip: 5.0
+  ema_decay: 0.999            # EMA of *weights*, not a mean-teacher consistency term
+  amp: true
+  find_unused_parameters: false   # this graph has none; the traversal is pure cost
+  fp16_allreduce: true            # compress DDP gradients to fp16 over PCIe
+  ddp_timeout_min: 60
+  num_workers: 4                  # per rank; divided by world size at runtime
+  prefetch_factor: 4
+  log_every: 100                  # steps between progress lines (it/s, data-wait, memory)
+  # Validation runs on every GPU (each scores its shard) on the EMA weights.
+  # Early epochs only monitor; the checkpoint that wins comes from the end.
+  eval_every: 2               # evaluate every N epochs (and always the last) ...
+  eval_last: 0                # ... plus every epoch for the final N
+  eval_raw: false             # also score the raw (non-EMA) weights: 2x eval cost
+  eval_batch_size: 0          # 0 = 2 x batch_size (no activations kept for backward)
+  unfreeze_epoch: 999         # off until it is measured against a frozen run of
+                              # the same length. It bought +0.0025 in the only
+                              # run that used it, and the slide it appeared to
+                              # cause happens without it.
+  unfreeze_blocks: 4
+  checkpoint_unfrozen: false  # recompute the trainable blocks' activations in
+                              # backward (never the frozen stack) - only if the
+                              # unfrozen phase runs out of memory
+  unfreeze_grad_accum: 1      # micro-batches per step once unfrozen, the last
+                              # resort for memory after checkpoint_unfrozen
+  # Sampling pools, not loss tiers - `synth` is gold-tier for the loss. The
+  # 20000 synthetic clips used to sit inside the gold pool and outnumber the
+  # ~8900 real gold clips there, so 69% of every gold draw was our own splicing
+  # and the epoch length was set by it.
+  # Global batches per epoch, independent of pool sizes. 1200 x 48 = 57.6k
+  # clips, matching the diet the 1.1881 baseline was trained on. Leave at 0 to
+  # go back to "the smallest pool sets the epoch", which is what silently cut
+  # the epoch to 25k clips once synth left the gold pool.
+  steps_per_epoch: 1200
+  # Sampling pools, not loss tiers - `synth` is gold-tier for the loss. Sized so
+  # each epoch draws ~24k silver (the baseline drew 20.5k), ~12k real gold,
+  # ~15.6k synthetic: at least as much silver as the run being matched, without
+  # putting the synthetic clips back into the pool that sets the epoch length.
+  tier_quotas:
+    gold: 0.21
+    silver: 0.42              # val is 87% silver; training at 50% gold was a
+    bronze: 0.10              # train/eval distribution mismatch on top of it
+    synth: 0.27
+
+loss:
+  cls: 1.0                    # focal on actionness
+  reg: 2.0                    # 1D DIoU on decoded spans
+  dfl: 0.5                    # distribution focal loss on boundary bins
+  quality: 0.5                # centerness
+  frame: 0.5                  # tier-masked frame BCE
+  dice: 1.0                   # soft Dice on the class-agnostic mask == half the metric
+  clip: 0.5                   # attention-pooled clip tags (the bronze tier's route in)
+  speech: 0.2                 # VAD auxiliary head
+  count: 0.2                  # events-per-clip head
+  bmap: 1.0                   # per-frame onset/offset map on the 20 ms grid
+  silver_bmap_weight: 0.15    # silver's spans are measurably coarser: median
+                              # event 0.98 s vs gold's 0.45 s, coverage 0.585 vs
+                              # 0.287, 29.6% starting at exactly 0.000 s
+  iou_quality: true           # quality regresses span IoU, not centerness
+  qfl: true                   # classification target is the span's own IoU.
+                              # Measured on fold 0: over the same candidates,
+                              # the right *number* of spans is worth +0.037 and
+                              # the right *spans* +0.28, so ranking is where the
+                              # score is - and a separate quality head cannot fix
+                              # it because it only ever sees positives.
+  # Pyramid level assignment. The old fixed table put every event at 4-8 strides
+  # long whatever its scale, so the metric's tolerance was 1.25 DFL bins wide for
+  # everything above half a second. Deriving the ranges from the bin geometry
+  # instead - finest level whose bins still reach the boundaries - makes it 2.50
+  # bins for every event over 0.5 s.
+  level_fill: 0.75
+  legacy_level_ranges: false  # true reproduces the old [(0,8),(8,16),...] table
+  # Silver's *tags* are as good as gold's; only its *timestamps* are unverified.
+  # So silver is down-weighted on frame/boundary terms only - the boundary
+  # down-weight itself lives in losses.py (0.25) where the spans are assigned.
+  silver_frame_weight: 0.5
+
+postproc:
+  # There is no detection threshold to tune here. These select *which* spans to
+  # keep; the boundaries themselves come from the regression head.
+  nms_sigma: 0.15              # tighter decay: near-duplicate spans are pure FPs.
+                               # Measured on the v2 checkpoint: 0.15 -> 1.2019,
+                               # 0.30 -> 1.1981, 0.50 -> 1.1952, 0.80 -> 1.1939.
+  nms_iou: 0.35                # read only by mode="linear"; the gaussian decay
+                               # has no threshold in it, so this is inert by
+                               # default. Kept so the linear ablation still runs.
+  score_floor: 0.05
+  count_weight: 1.0           # 1.0 = let the count head decide how many events
+  count_mode: expected        # the argmax is 1 almost everywhere (71% of silver
+                              # clips hold one event), which is how the last run
+                              # emitted 1.18 events/clip against a 1.44 reference
+  count_slack: 0               # trust the count head. A duplicate span is a
+                               # guaranteed false positive under 1-to-1 matching
+                               # *and* inflates coverage, so hedging upward loses
+                               # on both halves of the score. The calibrator can
+                               # still move this per district.
+  min_dur: 0.03
+  merge_gap: 0.0              # v1's merging dilated spans by a median 0.20 s
+  max_out: 16
+  score_scale: 1.0            # overwritten per district by the calibrator
+  quality_power: 0.0          # exponent on the quality head in the span score.
+                              # 0 under QFL: actionness is already the joint
+                              # detection-and-localisation score there.
+  # --- boundary branch, applied before SoftNMS ---
+  # Both OFF by default: measured on the 24-epoch fold-0 run, refinement *costs*
+  # score and does so monotonically in how much of it you do -
+  #   off 1.1723 | window 0.15 1.1643 | 0.25 1.1537 | 0.40 1.1300
+  #   off 1.1723 | peak_min 0.40 1.1675 | 0.20 1.1537 | 0.05 1.1489
+  # and boundary agreement in the ranking is a wash (1.1723 -> 1.1704). The
+  # reason is in the error distribution: the onset median is +0.010 s and the
+  # offset median +0.003 s, so the endpoints already inside a refinement window
+  # are the ones the regression head placed *well*. Moving them can only help if
+  # the branch is more accurate than the head, and as trained it is not. Turn
+  # these on only against a checkpoint whose branch has been shown to beat the
+  # head, not on principle.
+  refine: false               # snap endpoints onto the branch's peaks
+  refine_window: 0.15         # search +- max(this * duration, refine_window_min)
+  refine_window_min: 0.08     # never wider than the metric's own tolerance
+  refine_peak_min: 0.40       # below this the window holds no boundary: don't move
+  agree_weight: 0.0           # exponent on boundary agreement in the span score

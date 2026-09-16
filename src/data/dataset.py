@@ -1,0 +1,369 @@
+"""Dataset, tier-balanced sampler, and the state-grouped k-fold split.
+
+Two changes from v1 that matter.
+
+**Spans, not just frame masks.** The model regresses boundaries, so the dataset
+emits the events themselves - (onset, offset) in base frames - alongside the
+rasterised frame target the auxiliary heads still need.
+
+**k-fold by state, not one holdout.** v1 held out five states
+(Himachal / MP / Tripura / Rajasthan / Nagaland) and tuned eight classes' worth
+of post-processing against that single slice. The test set spans ~150 districts
+across 25+ states, and the val-to-leaderboard drop was 0.16. Selecting a
+checkpoint on one narrow slice is how that happens; `--fold` makes the holdout
+rotate so model selection averages over folds instead.
+"""
+from __future__ import annotations
+
+import io
+import json
+import math
+import os
+import random
+from pathlib import Path
+from typing import Dict, List, Sequence
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, Sampler
+
+from src.data.labels import LabelEncoder
+
+TIER_IDS = {"gold": 0, "silver": 1, "bronze": 2}
+MAX_EVENTS = 12          # 99.99th percentile of the corpus is 7
+
+
+def load_manifest(path: str | Path) -> List[dict]:
+    recs = []
+    with Path(path).open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                recs.append(json.loads(line))
+    return recs
+
+
+def state_folds(recs: Sequence[dict], n_folds: int = 5, seed: int = 1234,
+                group_by: str = "state") -> List[List[str]]:
+    """Partition the grouping keys into `n_folds` roughly equal-sized folds.
+
+    Balanced by clip count rather than by number of states, because Vaani's
+    states differ in size by more than an order of magnitude and a naive
+    round-robin would give one fold most of the data.
+    """
+    ts = [r for r in recs if r.get("events")]
+    counts: Dict[str, int] = {}
+    for r in ts:
+        counts[str(r.get(group_by, "")) or "_"] = counts.get(
+            str(r.get(group_by, "")) or "_", 0) + 1
+    keys = sorted(counts, key=lambda k: -counts[k])
+    rng = random.Random(seed)
+    rng.shuffle(keys)
+    keys.sort(key=lambda k: -counts[k])            # stable: largest first
+    folds: List[List[str]] = [[] for _ in range(n_folds)]
+    sizes = [0] * n_folds
+    for k in keys:                                  # greedy longest-processing-time
+        i = min(range(n_folds), key=lambda j: sizes[j])
+        folds[i].append(k)
+        sizes[i] += counts[k]
+    return folds
+
+
+def split_manifest(recs: List[dict], fold: int = 0, n_folds: int = 5,
+                   seed: int = 1234, group_by: str = "state"):
+    """Hold out one state-fold. Bronze always trains (it has nothing to score)."""
+    ts = [r for r in recs if r.get("events")]
+    bronze = [r for r in recs if not r.get("events")]
+    if not ts:
+        return recs, []
+    folds = state_folds(recs, n_folds, seed, group_by)
+    held = set(folds[fold % n_folds])
+    val = [r for r in ts if (str(r.get(group_by, "")) or "_") in held]
+    if not val or len(val) > 0.5 * len(ts):
+        # Single-state corpora (or a tiny download) cannot be split by state;
+        # fall back to a random clip split rather than returning an empty val.
+        rng = random.Random(seed)
+        shuffled = list(ts)
+        rng.shuffle(shuffled)
+        cut = max(1, int(len(ts) / n_folds))
+        val = shuffled[fold * cut:(fold + 1) * cut] or shuffled[:cut]
+    val_uids = {r["uid"] for r in val}
+    train = [r for r in ts if r["uid"] not in val_uids] + bronze
+    return train, val
+
+
+class VaaniSpanDataset(Dataset):
+    def __init__(self, records: Sequence[dict], root: str | Path, le: LabelEncoder,
+                 clip_len: float = 8.0, sr: int = 16000, fps: float = 25.0,
+                 train: bool = True, vad_dir: str | Path | None = None,
+                 labels_only: bool = False):
+        self.recs = list(records)
+        self.root = Path(root)
+        self.le = le
+        self.clip_len = float(clip_len)
+        self.sr = int(sr)
+        self.fps = float(fps)
+        # `train` only randomises the crop. Gain/noise augmentation happens on the
+        # GPU in the training loop (`train.gpu_augment`), off the host CPUs.
+        self.train = train
+        self.n_samples = int(round(self.clip_len * self.sr))
+        self.n_frames = int(round(self.clip_len * self.fps))
+        self.vad_dir = Path(vad_dir) if vad_dir else None
+        # `labels_only` skips the audio decode and returns silence in its place.
+        # `build_refs` wants nothing but `spans` and `uid`, and decoding 14.5k
+        # validation clips to read two label tensors off them costs a minute of
+        # every run for nothing.
+        self.labels_only = bool(labels_only)
+
+    def __len__(self) -> int:
+        return len(self.recs)
+
+    def _fd(self, path: Path) -> int:
+        # One descriptor per pack per process, opened lazily so each DataLoader
+        # worker gets its own; `os.pread` never touches the file offset, so
+        # nothing is shared that could race.
+        fds = self.__dict__.setdefault("_fds", {})
+        key = str(path)
+        if key not in fds:
+            fds[key] = os.open(key, os.O_RDONLY)
+        return fds[key]
+
+    def _load_wav(self, rec: dict) -> np.ndarray:
+        import soundfile as sf
+        # `_root` lets a synthetic manifest live in its own directory and still
+        # be mixed into one training set.
+        root = Path(rec.get("_root", self.root))
+        if "pack" in rec:                      # scripts/pack_data.py layout
+            blob = os.pread(self._fd(root / rec["pack"]), int(rec["nbytes"]),
+                            int(rec["off"]))
+            src = io.BytesIO(blob)
+        else:
+            src = str(root / rec["path"])
+        y, sr = sf.read(src, dtype="float32", always_2d=False)
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        if sr != self.sr:
+            import librosa
+            y = librosa.resample(y, orig_sr=sr, target_sr=self.sr)
+        return y.astype("float32")
+
+    def _vad_array(self, rec: dict):
+        if "vad_off" in rec:                   # packed: one float16 file per root
+            root = Path(rec.get("_root", self.root))
+            mm = self.__dict__.setdefault("_vad_mm", {})
+            if str(root) not in mm:
+                mm[str(root)] = np.memmap(root / "vad.f16", dtype="float16", mode="r")
+            a = int(rec["vad_off"])
+            return mm[str(root)][a:a + int(rec["vad_n"])]
+        if self.vad_dir is None:
+            return None
+        p = self.vad_dir / (rec["uid"] + ".npy")
+        return np.load(p) if p.exists() else None
+
+    def _load_vad(self, rec: dict, t_off: float) -> tuple:
+        v = self._vad_array(rec)
+        if v is None:
+            return np.zeros((self.n_frames,), "float32"), 0.0
+        v = np.asarray(v, dtype="float32")          # speech prob at self.fps
+        a = int(round(t_off * self.fps))
+        v = v[a:a + self.n_frames]
+        out = np.zeros((self.n_frames,), "float32")
+        out[:len(v)] = v
+        return out, 1.0
+
+    def __getitem__(self, i: int) -> dict:
+        rec = self.recs[i]
+        # The crop offset below is a function of the clip's *length* only, so
+        # labels can be produced from the manifest duration without touching the
+        # audio - but only if the duration is actually there. A missing one would
+        # silently shift every reference span, so fall back to decoding.
+        if self.labels_only and rec.get("duration"):
+            y = np.zeros((max(1, int(round(float(rec["duration"]) * self.sr))),),
+                         "float32")
+        else:
+            y = self._load_wav(rec)
+        events = rec.get("events") or []
+
+        # --- crop / pad to the window, shifting event times with the crop ---
+        offset = 0
+        if len(y) > self.n_samples:
+            if self.train:
+                offset = random.randint(0, len(y) - self.n_samples)
+            else:
+                offset = (len(y) - self.n_samples) // 2
+            y = y[offset:offset + self.n_samples]
+        valid_samples = len(y)
+        if len(y) < self.n_samples:
+            y = np.pad(y, (0, self.n_samples - len(y)))
+        t_off = offset / self.sr
+
+        C, F = len(self.le), self.n_frames
+        frame_t = np.zeros((F, C), dtype="float32")
+        spans = np.full((MAX_EVENTS, 2), -1.0, dtype="float32")
+        span_cls = np.full((MAX_EVENTS,), -1, dtype="int64")
+        n_ev = 0
+
+        for ev in events:
+            ci = self.le.idx.get(ev["cls"])
+            if ci is None:
+                continue
+            s = (float(ev["start"]) - t_off) * self.fps
+            e = (float(ev["end"]) - t_off) * self.fps
+            # Keep only events that survive the crop with real support. A sliver
+            # clipped to 2 frames teaches a boundary that is not in the audio.
+            s_c, e_c = max(0.0, s), min(float(F), e)
+            if e_c - s_c < 0.25 or e_c <= s_c:
+                continue
+            a, b = int(math.floor(s_c)), int(math.ceil(e_c))
+            if b > a:
+                frame_t[a:b, ci] = 1.0
+            else:
+                frame_t[min(a, F - 1), ci] = 1.0
+            if n_ev < MAX_EVENTS:
+                spans[n_ev] = (s_c, e_c)
+                span_cls[n_ev] = ci
+                n_ev += 1
+
+        clip_t = np.zeros((C,), dtype="float32")
+        if events:
+            clip_t = frame_t.max(axis=0)
+        else:
+            for ci in self.le.encode_clip_categories(rec.get("clip_labels")):
+                clip_t[ci] = 1.0
+
+        tier = rec.get("tier", "bronze")
+        n_valid = int(min(F, math.ceil(valid_samples / self.sr * self.fps)))
+        frame_valid = np.zeros((F,), dtype="float32")
+        frame_valid[:max(1, n_valid)] = 1.0
+        speech, has_vad = self._load_vad(rec, t_off)
+
+        return {
+            "wav": torch.from_numpy(y),
+            "frame_target": torch.from_numpy(frame_t),
+            "clip_target": torch.from_numpy(clip_t),
+            "frame_valid": torch.from_numpy(frame_valid),
+            "spans": torch.from_numpy(spans),
+            "span_cls": torch.from_numpy(span_cls),
+            "n_events": torch.tensor(n_ev, dtype=torch.long),
+            "speech_target": torch.from_numpy(speech),
+            "has_vad": torch.tensor(has_vad, dtype=torch.float32),
+            "tier": torch.tensor(TIER_IDS.get(tier, 2), dtype=torch.long),
+            "uid": rec["uid"],
+        }
+
+
+def collate(batch: List[dict]) -> dict:
+    out = {}
+    for k in batch[0]:
+        if k == "uid":
+            out[k] = [b[k] for b in batch]
+        else:
+            out[k] = torch.stack([b[k] for b in batch])
+    return out
+
+
+class TierBatchSampler(Sampler):
+    """Compose every batch from fixed per-tier quotas, sharded across ranks.
+
+    Kept from v1: with tiers this imbalanced a plain random sampler produces
+    batches with no gold at all, and the boundary terms then have nothing
+    trustworthy to learn from for whole stretches of training.
+
+    **Rank sharding.** Every rank builds the identical global batch list (same
+    records, same seed) and then keeps only its own stride-`world_size` slice of
+    it. Without that slice, which is how this was written until now, both ranks
+    of a `torchrun --nproc_per_node 2` job draw the *same* indices on every step:
+    the seed is identical, the record order is identical, and nothing in the
+    sampler ever looks at the rank. DDP then all-reduces two copies of one
+    gradient, so a 2-GPU run costs twice the compute of a 1-GPU run and learns
+    from exactly the same 16 clips per step. Sharding turns the second GPU back
+    into a real doubling of the effective batch.
+    """
+
+    def __init__(self, records: Sequence[dict], batch_size: int,
+                 quotas: Dict[str, float] | None = None, seed: int = 0,
+                 rank: int = 0, world_size: int = 1, steps_per_epoch: int = 0):
+        self.records = list(records)
+        self.batch_size = int(batch_size)
+        self.seed = seed
+        self.rank = int(rank)
+        self.world_size = max(1, int(world_size))
+        self.by_tier: Dict[str, List[int]] = {}
+        for i, r in enumerate(self.records):
+            # `pool` overrides `tier` for *sampling* only. The two are different
+            # questions: a tier says how far to trust a clip's timestamps, a pool
+            # says how often to draw it.
+            self.by_tier.setdefault(r.get("pool") or r.get("tier", "bronze"),
+                                    []).append(i)
+        self.by_tier = {k: v for k, v in self.by_tier.items() if v}
+
+        quotas = quotas or {"gold": 0.35, "silver": 0.35, "bronze": 0.10,
+                            "synth": 0.20}
+        quotas = {k: v for k, v in quotas.items() if k in self.by_tier and v > 0}
+        tot = sum(quotas.values()) or 1.0
+        raw = {k: self.batch_size * v / tot for k, v in quotas.items()}
+        self.counts = {k: int(math.floor(v)) for k, v in raw.items()}
+        rem = self.batch_size - sum(self.counts.values())
+        for k in sorted(raw, key=lambda k: raw[k] - math.floor(raw[k]), reverse=True):
+            if rem <= 0:
+                break
+            self.counts[k] += 1
+            rem -= 1
+        self.counts = {k: v for k, v in self.counts.items() if v > 0}
+        # Epoch length. Deriving it from the *smallest* pool - which is what
+        # `min` here does - couples it to whichever tier happens to be rarest,
+        # and that broke badly when the synthetic clips were moved out of the
+        # gold pool: real gold (~8900 clips) became the smallest pool and the
+        # epoch shrank from 57792 clips to 25104. Two runs then trained on 40%
+        # of the data the baseline had at its peak, and 2.5x less silver, on a
+        # validation split that is 87% silver. `steps_per_epoch` sets it
+        # directly instead; the pools that cannot fill it are reshuffled and
+        # drawn again, which is what `_global_batches` already does.
+        if steps_per_epoch > 0:
+            # Capped at four passes over the largest pool. `steps_per_epoch` is
+            # in global batches and so is a function of the corpus it was chosen
+            # for; without the cap, pointing this config at a small corpus (the
+            # smoke test's 78 clips, a partial download) turns one epoch into
+            # thousands of passes over the same handful of files.
+            widest = max(len(v) for v in self.by_tier.values())
+            self._nb = max(1, min(int(steps_per_epoch),
+                                  4 * widest // max(1, self.batch_size)))
+        else:
+            self._nb = max(1, min(len(self.by_tier[k]) // c
+                                  for k, c in self.counts.items()))
+        # Truncate to a whole number of rounds so every rank yields the same
+        # number of batches. A rank that runs short leaves its peers blocked in
+        # an all-reduce that never completes.
+        self._per_rank = max(1, self._nb // self.world_size)
+
+    def __len__(self) -> int:
+        return self._per_rank
+
+    def _global_batches(self) -> List[List[int]]:
+        rng = random.Random(self.seed)
+        pools = {k: list(v) for k, v in self.by_tier.items()}
+        for v in pools.values():
+            rng.shuffle(v)
+        ptr = {k: 0 for k in pools}
+        out: List[List[int]] = []
+        for _ in range(self._per_rank * self.world_size):
+            batch: List[int] = []
+            for k, c in self.counts.items():
+                pool = pools[k]
+                if c > len(pool):
+                    batch.extend(rng.choice(pool) for _ in range(c))
+                    continue
+                if ptr[k] + c > len(pool):
+                    rng.shuffle(pool)
+                    ptr[k] = 0
+                batch.extend(pool[ptr[k]:ptr[k] + c])
+                ptr[k] += c
+            rng.shuffle(batch)
+            out.append(batch)
+        return out
+
+    def __iter__(self):
+        batches = self._global_batches()
+        self.seed += 1
+        for b in batches[self.rank::self.world_size]:
+            yield b

@@ -1,0 +1,107 @@
+seed: 42
+output_dir: runs/query
+
+# Shares the [data] block with default.yaml verbatim: same frontend, same
+# windowing, same k-fold. Only [model.query] and the loss/postproc keys that
+# no longer apply (count_weight, refine, ...) are new.
+data:
+  root: data/vaani
+  sr: 16000
+  n_mels: 128
+  hop: 160
+  clip_len: 8.0
+  fps: 25.0
+  expand_vehicle: true
+  n_folds: 5
+  vad_dir: ""
+
+model:
+  encoders: [atst_frame, beats]
+  atst_ckpt: ""
+  beats_ckpt: ""
+  beats_dir: checkpoints
+  proj_dim: 256
+  freeze_encoders: true
+
+  d_model: 384
+  n_levels: 5            # the FPN still builds all 5; the query decoder only
+                          # cross-attends to level 0 (see query_head.py)
+  n_base_layers: 2
+  n_head: 8
+  n_bins: 16
+  dropout: 0.15
+  boundary_branch: true
+  boundary_mult: 2
+  boundary_tap: 1
+  specaug: true
+  flux: true
+
+  # ---- query decoder ----
+  query:
+    n_queries: 24         # 83% of clips hold exactly one event; generous headroom
+    n_stages: 3           # coarse placement, then two refinement passes
+    coarse_delta: 4.0     # seconds either side of the initial guess, stage 0
+    refine_delta: 0.4     # seconds either side, stages 1+
+
+train:
+  epochs: 20
+  batch_size: 16
+  lr: 0.0005
+  encoder_lr_scale: 0.02
+  weight_decay: 0.05
+  warmup_steps: 800
+  grad_clip: 5.0
+  ema_decay: 0.999
+  amp: true
+  find_unused_parameters: false
+  fp16_allreduce: true
+  ddp_timeout_min: 60
+  num_workers: 4
+  prefetch_factor: 4
+  log_every: 100
+  eval_every: 2
+  eval_last: 0
+  eval_raw: false
+  eval_batch_size: 0
+  unfreeze_epoch: 999
+  unfreeze_blocks: 4
+  checkpoint_unfrozen: false
+  unfreeze_grad_accum: 1
+  steps_per_epoch: 1200
+  tier_quotas:
+    gold: 0.21
+    silver: 0.42
+    bronze: 0.10
+    synth: 0.27
+
+loss:
+  presence: 1.0          # focal on "does this query correspond to a real event"
+  reg: 2.0                # 1D DIoU on the decoded span, last stage weighted equally
+  dfl: 0.5                 # distribution focal loss on each stage's refinement bins
+  dice: 1.0                # soft Dice on the class-agnostic frame mask
+  frame: 0.5                # tier-masked frame BCE (bronze's only route in)
+  clip: 0.5                  # attention-pooled clip tags
+  speech: 0.2                 # VAD auxiliary head
+  bmap: 1.0                    # 20 ms onset/offset map
+  silver_bmap_weight: 0.15
+  silver_frame_weight: 0.5
+  eos_coef: 0.1                  # DETR's fix for exactly this imbalance: with
+                                  # n_queries >> events/clip, unmatched queries
+                                  # outnumber matched ones ~20:1, and
+                                  # sigmoid_focal's alpha already *up*-weights
+                                  # negatives (alpha=0.25 -> neg weight 0.75 vs
+                                  # pos weight 0.25) since it assumes a dense,
+                                  # not sparse, positive/negative split. Without
+                                  # this the presence head learns "always say
+                                  # no" - confirmed by test_query_overfit.py
+                                  # failing with every prediction empty at
+                                  # eos_coef 1.0.
+
+postproc:
+  # No count head, no threshold sweep: the query decoder answers "which
+  # spans" directly. SoftNMS is a safety net against near-duplicate queries,
+  # not a selection mechanism.
+  nms_sigma: 0.15
+  score_floor: 0.05
+  min_dur: 0.03
+  max_out: 16

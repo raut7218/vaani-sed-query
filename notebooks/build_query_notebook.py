@@ -96,6 +96,14 @@ SYNTH    = WORK + "/synth"
 PRETRAIN = WORK + "/pretrain_data"
 RUN      = WORK + "/runs/f%d" % FOLD
 PRETRAIN_RUN = WORK + "/runs/pretrain"
+
+if SMOKE_TEST and not TEST_AUDIO_DIR:
+    # Smoke-only: no real held-out test set is attached to this kernel, so
+    # reuse the just-downloaded training audio to exercise predict_query.py
+    # and the submission-schema check end-to-end. Never do this for the real
+    # run - TEST_AUDIO_DIR must point at the actual competition test set.
+    TEST_AUDIO_DIR = DATA + "/audio"
+
 print("data:", DATA, "| run:", RUN, "| smoke test:", SMOKE_TEST)
 '''),
 

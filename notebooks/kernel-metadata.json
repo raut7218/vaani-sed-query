@@ -1,0 +1,13 @@
+{
+  "id": "gauravraut1/vaani-track1-query-smoke-test",
+  "title": "Vaani Track1 Query Smoke Test",
+  "code_file": "Vaani_Track1_Query_Kaggle.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}

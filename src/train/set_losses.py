@@ -105,11 +105,11 @@ class SetSpanLoss:
         for b, (qi, ti) in enumerate(matches):
             if qi.numel() == 0:
                 continue
-            valid_spans = spans_sec[b][valid[b]]
+            valid_spans = spans_sec[b][valid[b]].to(tgt_s.dtype)
             pos[b, qi] = 1.0
             tgt_s[b, qi] = valid_spans[ti, 0]
             tgt_e[b, qi] = valid_spans[ti, 1]
-            bw[b, qi] = ev_w[b]
+            bw[b, qi] = ev_w[b].to(bw.dtype)
 
         n_pos = pos.sum().clamp(min=1.0)
         pres_w = torch.where(pos > 0.5, torch.ones_like(pos),

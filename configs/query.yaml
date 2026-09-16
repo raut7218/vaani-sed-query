@@ -53,7 +53,13 @@ train:
   grad_clip: 5.0
   ema_decay: 0.999
   amp: true
-  find_unused_parameters: false
+  # true: has_vad is never populated by dataset.py's collate for this
+  # pipeline, so the speech/VAD auxiliary head's params never enter the loss
+  # graph - permanently unused, not just sometimes - which DDP's default
+  # (false) can't tolerate. Confirmed by the Kaggle GPU smoke test failing
+  # with "Expected to have finished reduction in the prior iteration" on the
+  # second training step of every DDP run.
+  find_unused_parameters: true
   fp16_allreduce: true
   ddp_timeout_min: 60
   num_workers: 4

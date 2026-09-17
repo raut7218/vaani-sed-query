@@ -21,6 +21,7 @@ submission.zip
 submission.jsonl
 .DS_Store
 
-# scratch push copy for the real (SMOKE_TEST=False) Kaggle run - never the
-# committed default, see notebooks/build_query_notebook.py
+# scratch push copies for non-default SCALE tiers - never the committed
+# default, see notebooks/build_query_notebook.py
 /notebooks/full_run/
+/notebooks/medium_test/

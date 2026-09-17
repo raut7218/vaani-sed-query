@@ -30,11 +30,21 @@ decoder with a single end-to-end DETR/TadTR-style set-prediction decoder on the
 same dual-SSL frontend, plus label-free splice-boundary pretraining on the whole
 154.6 h corpus. See `docs/superpowers/specs/` for the design rationale.
 
-**`SMOKE_TEST = True`** (the default below) runs every stage at toy scale - a
-few hundred clips, a handful of steps, one epoch - so the *whole* pipeline
-(data, pretrain, fine-tune, predict, submission validation) is proven to run
-start-to-finish on this Kaggle image before any real GPU-hours are spent. Flip
-it to `False` only after a smoke run has finished clean.
+**`SCALE = "smoke"`** (the default below) runs every stage at toy scale - a few
+hundred clips, a handful of steps, one epoch - proving the pipeline's *logic*
+runs start-to-finish in about a minute of GPU time.
+
+**`SCALE = "medium"`** runs a few thousand real clips through 2 pretrain and 2
+fine-tune epochs - enough to actually download real data, hit real disk usage,
+and trigger two real checkpoint saves back-to-back (the exact sequence that
+silently hung once at full scale - see the disk-guard comments in
+`scripts/make_synthetic.py`/`make_splice_pretrain.py`). Finishes in
+~15-20 minutes. Run this before `"full"`, not just `"smoke"` - `"smoke"`'s
+tiny scale never gets disk or checkpoint I/O anywhere near what the real run
+sees, which is exactly why it never caught those bugs.
+
+**`SCALE = "full"`** is the real run. Only flip to it after `"medium"` has
+finished clean.
 """),
 
 code("""# ============================ HF TOKEN ================================
@@ -49,31 +59,43 @@ code('''# ============================== CONFIG ==============================
 REPO = "raut7218/vaani-sed-query"
 REPO_IS_PRIVATE = False
 
-SMOKE_TEST = True     # see the markdown above - flip to False for the real run
+SCALE = "smoke"     # "smoke" | "medium" | "full" - see the markdown above
+
+# Everything below is keyed off SCALE so there is exactly one place that
+# defines what each tier means - see PRESETS.
+PRESETS = {
+    #              shards limit pretrain psteps pepochs ptimelim synth epochs bs  steps timelim
+    "smoke":  dict(shards=2,   limit=600, pretrain=300,   psteps=20, pepochs=1, ptimelim=0.0,
+                   synth=300,  epochs=1,  bs=4,  steps=10, timelim=0.0),
+    "medium": dict(shards=8,   limit=0,   pretrain=3000,  psteps=0,  pepochs=2, ptimelim=0.0,
+                   synth=1500, epochs=2,  bs=16, steps=0,  timelim=0.0),
+    "full":   dict(shards=0,   limit=0,   pretrain=60000, psteps=0,  pepochs=3, ptimelim=2.5,
+                   synth=20000, epochs=20, bs=16, steps=0, timelim=8.5),
+}[SCALE]
 
 # --- data ---------------------------------------------------------------
 DATA_FROM  = ""               # e.g. "/kaggle/input/vaani-prepared" to skip the download
-MAX_SHARDS = 2 if SMOKE_TEST else 0     # 0 = all 182 shards (~16.5 GB)
-DATA_LIMIT = 600 if SMOKE_TEST else 0   # debug: stop the download after N clips
+MAX_SHARDS = PRESETS["shards"]     # 0 = all 182 shards (~16.5 GB)
+DATA_LIMIT = PRESETS["limit"]      # debug: stop the download after N clips
 
 # --- self-supervised pretraining (splice-boundary, full corpus) ---------
 USE_PRETRAIN   = True
-N_PRETRAIN     = 300 if SMOKE_TEST else 60000
-PRETRAIN_STEPS = 20 if SMOKE_TEST else 0     # 0 = a full epoch (--max-steps 0)
-PRETRAIN_EPOCHS = 1 if SMOKE_TEST else 3
-PRETRAIN_TIME_LIMIT_H = 0.0 if SMOKE_TEST else 2.5   # stop cleanly, leave state.pt, well inside Kaggle's ~12h cap
+N_PRETRAIN     = PRESETS["pretrain"]
+PRETRAIN_STEPS = PRESETS["psteps"]     # 0 = a full epoch (--max-steps 0)
+PRETRAIN_EPOCHS = PRESETS["pepochs"]
+PRETRAIN_TIME_LIMIT_H = PRESETS["ptimelim"]   # stop cleanly, leave state.pt, well inside Kaggle's ~12h cap
 
 # --- fine-tune ------------------------------------------------------------
 FOLD        = 0
-EPOCHS      = 1 if SMOKE_TEST else 20
-BATCH_SIZE  = 4 if SMOKE_TEST else 16       # PER GPU
-MAX_STEPS   = 10 if SMOKE_TEST else 0       # 0 = a full epoch
-TIME_LIMIT_H = 0.0 if SMOKE_TEST else 8.5    # same idea; re-run with RESUME_FROM set to continue
+EPOCHS      = PRESETS["epochs"]
+BATCH_SIZE  = PRESETS["bs"]         # PER GPU
+MAX_STEPS   = PRESETS["steps"]      # 0 = a full epoch
+TIME_LIMIT_H = PRESETS["timelim"]   # same idea; re-run with RESUME_FROM set to continue
 RESUME_FROM = ""
 
 USE_VAD       = True
 USE_SYNTHETIC = True
-N_SYNTHETIC   = 300 if SMOKE_TEST else 20000
+N_SYNTHETIC   = PRESETS["synth"]
 
 # --- inference ------------------------------------------------------------
 TEST_AUDIO_DIR = ""           # run the "find eval audio" cell, paste the path here
@@ -99,14 +121,15 @@ PRETRAIN = WORK + "/pretrain_data"
 RUN      = WORK + "/runs/f%d" % FOLD
 PRETRAIN_RUN = WORK + "/runs/pretrain"
 
-if SMOKE_TEST and not TEST_AUDIO_DIR:
-    # Smoke-only: no real held-out test set is attached to this kernel, so
-    # reuse the just-downloaded training audio to exercise predict_query.py
-    # and the submission-schema check end-to-end. Never do this for the real
-    # run - TEST_AUDIO_DIR must point at the actual competition test set.
+if SCALE != "full" and not TEST_AUDIO_DIR:
+    # smoke/medium only: no real held-out test set is attached to this
+    # kernel, so reuse the just-downloaded training audio to exercise
+    # predict_query.py and the submission-schema check end-to-end. Never do
+    # this for the real run - TEST_AUDIO_DIR must point at the actual
+    # competition test set.
     TEST_AUDIO_DIR = DATA + "/audio"
 
-print("data:", DATA, "| run:", RUN, "| smoke test:", SMOKE_TEST)
+print("data:", DATA, "| run:", RUN, "| scale:", SCALE)
 '''),
 
 md("## 1. Fetch the repo, and the credentials"),
@@ -336,8 +359,9 @@ else:
              np.mean([len(r["events"]) for r in rows]),
              100 * np.mean([not r["events"] for r in rows])))
     print(rows[0])
-    print("\\nSMOKE_TEST =", SMOKE_TEST,
-          "- if True and this printed cleanly, flip it to False and Save & Run All for real.")
+    print("\\nSCALE =", SCALE,
+          "- if this printed cleanly, move to the next tier (smoke -> medium -> full) "
+          "and Save & Run All again.")
 '''),
 ]
 

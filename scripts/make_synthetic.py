@@ -118,7 +118,13 @@ def main() -> None:
 
     n_samp = int(args.clip_len * args.sr)
     written, man = 0, (out / "manifest.jsonl").open("w", encoding="utf-8")
-    MIN_FREE_BYTES = 2 * 1024**3
+    # 2 GB left the very next checkpoint write with almost no margin: on a
+    # nearly-full disk a ~475 MB state.pt/best.pt pair can go from a
+    # few-second write to a many-minute stall, and since AsyncSaver.submit()
+    # joins the *previous* save before starting the next, that stall blocks
+    # the following epoch's dist.barrier() with no error and no output -
+    # confirmed on a real run (stuck 48+ min after an eval line, no crash).
+    MIN_FREE_BYTES = 5 * 1024**3
 
     for i in range(args.num):
         if written % 500 == 0 and shutil.disk_usage(out).free < MIN_FREE_BYTES:

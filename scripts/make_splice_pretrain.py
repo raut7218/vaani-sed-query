@@ -80,7 +80,11 @@ def main() -> None:
 
     n_samp = int(args.clip_len * args.sr)
     written, man = 0, (out / "manifest.jsonl").open("w", encoding="utf-8")
-    MIN_FREE_BYTES = 2 * 1024**3
+    # See the matching comment in make_synthetic.py: 2 GB left training's own
+    # checkpoint writes (state.pt/best.pt, ~475 MB/epoch) almost no headroom,
+    # and a slow write on a nearly-full disk blocks the next epoch's
+    # dist.barrier() with no error and no output rather than failing fast.
+    MIN_FREE_BYTES = 5 * 1024**3
 
     for i in range(args.num):
         if written % 500 == 0 and shutil.disk_usage(out).free < MIN_FREE_BYTES:

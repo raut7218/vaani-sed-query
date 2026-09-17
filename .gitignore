@@ -20,3 +20,7 @@ third_party/atst/
 submission.zip
 submission.jsonl
 .DS_Store
+
+# scratch push copy for the real (SMOKE_TEST=False) Kaggle run - never the
+# committed default, see notebooks/build_query_notebook.py
+/notebooks/full_run/

@@ -18,9 +18,20 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import shutil
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+
+# huggingface_hub's default tqdm progress bar redraws on every chunk received;
+# over 182 shards that is many thousands of lines, and a long-running cloud
+# notebook (Kaggle, Colab) streams+persists all of a cell's output as it's
+# produced - that captured-output blob is what actually filled the disk on a
+# run that died with "No space left on device" after only ~10 of 182 shards,
+# long before the audio itself could plausibly account for it.
+from huggingface_hub.utils import disable_progress_bars
+
+disable_progress_bars()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -253,8 +264,19 @@ def main() -> None:
     n_written = n_skipped = n_failed = 0
     stop = False
 
+    MIN_FREE_BYTES = 2 * 1024**3  # stop with a clean, resumable manifest rather
+                                   # than crash mid-write into a full disk
+
     with man_path.open("a", encoding="utf-8") as fout:
         for fi, meta in enumerate(shards):
+            free = shutil.disk_usage(out).free
+            if free < MIN_FREE_BYTES:
+                print("[download] only %s free on device - stopping here with "
+                      "%d clips already materialised (re-run to fetch more once "
+                      "space is freed; already-done shards are skipped)"
+                      % (human(free), len(done)))
+                stop = True
+                break
             rel = meta["path"]
             if rel in shards_done:
                 print("[download] shard %d/%d  %s - already materialised, skipping"

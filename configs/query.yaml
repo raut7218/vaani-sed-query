@@ -60,6 +60,9 @@ train:
   # with "Expected to have finished reduction in the prior iteration" on the
   # second training step of every DDP run.
   find_unused_parameters: true
+  # The unused set above (the VAD/speech head) is always the same params,
+  # every step - DDP only needs one pass to find that, not one per step.
+  static_graph: true
   fp16_allreduce: true
   ddp_timeout_min: 60
   num_workers: 4

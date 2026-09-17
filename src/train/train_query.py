@@ -142,7 +142,12 @@ def main() -> None:
         ddp_net = torch.nn.parallel.DistributedDataParallel(
             _unwrap(net), device_ids=[device.index],
             find_unused_parameters=bool(t.get("find_unused_parameters", False)),
-            gradient_as_bucket_view=True)
+            gradient_as_bucket_view=True,
+            # The unused-parameter set (the VAD/speech head, see
+            # find_unused_parameters above) never changes between
+            # iterations, so DDP only needs to search for it once instead
+            # of on every step - static_graph tells it that's safe.
+            static_graph=bool(t.get("static_graph", True)))
         if bool(t.get("fp16_allreduce", True)):
             from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
             ddp_net.register_comm_hook(None, default_hooks.fp16_compress_hook)

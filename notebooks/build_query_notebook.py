@@ -67,10 +67,12 @@ PRESETS = {
     #              shards limit pretrain psteps pepochs ptimelim synth epochs bs  steps timelim
     "smoke":  dict(shards=2,   limit=600, pretrain=300,   psteps=20, pepochs=1, ptimelim=0.0,
                    synth=300,  epochs=1,  bs=4,  steps=10, timelim=0.0),
+    # bs=24/GPU: peak VRAM measured at 6.3/16 GB on a T4 at bs=16, so this
+    # has real headroom - see the throughput investigation.
     "medium": dict(shards=8,   limit=0,   pretrain=3000,  psteps=0,  pepochs=2, ptimelim=0.0,
-                   synth=1500, epochs=2,  bs=16, steps=0,  timelim=0.0),
+                   synth=1500, epochs=2,  bs=24, steps=0,  timelim=0.0),
     "full":   dict(shards=0,   limit=0,   pretrain=60000, psteps=0,  pepochs=3, ptimelim=2.5,
-                   synth=20000, epochs=20, bs=16, steps=0, timelim=8.5),
+                   synth=20000, epochs=20, bs=24, steps=0, timelim=8.5),
 }[SCALE]
 
 # --- data ---------------------------------------------------------------

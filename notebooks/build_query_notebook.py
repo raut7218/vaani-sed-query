@@ -61,12 +61,14 @@ USE_PRETRAIN   = True
 N_PRETRAIN     = 300 if SMOKE_TEST else 60000
 PRETRAIN_STEPS = 20 if SMOKE_TEST else 0     # 0 = a full epoch (--max-steps 0)
 PRETRAIN_EPOCHS = 1 if SMOKE_TEST else 3
+PRETRAIN_TIME_LIMIT_H = 0.0 if SMOKE_TEST else 2.5   # stop cleanly, leave state.pt, well inside Kaggle's ~12h cap
 
 # --- fine-tune ------------------------------------------------------------
 FOLD        = 0
 EPOCHS      = 1 if SMOKE_TEST else 20
 BATCH_SIZE  = 4 if SMOKE_TEST else 16       # PER GPU
 MAX_STEPS   = 10 if SMOKE_TEST else 0       # 0 = a full epoch
+TIME_LIMIT_H = 0.0 if SMOKE_TEST else 8.5    # same idea; re-run with RESUME_FROM set to continue
 RESUME_FROM = ""
 
 USE_VAD       = True
@@ -231,12 +233,13 @@ md("## 7. Pretrain (splice-boundary self-supervision)\n\n"
 
 code('''if USE_PRETRAIN:
     max_steps = "--max-steps %d" % PRETRAIN_STEPS if PRETRAIN_STEPS else ""
+    time_limit = "--time-limit-h %g" % PRETRAIN_TIME_LIMIT_H if PRETRAIN_TIME_LIMIT_H else ""
     get_ipython().system(
         "torchrun --standalone --nproc_per_node=%d -m src.train.train_query "
         "--config configs/kaggle_query.yaml --data %s --out %s "
-        "--epochs %d --batch-size %d %s"
+        "--epochs %d --batch-size %d %s %s"
         % (max(1, torch.cuda.device_count()), PRETRAIN, PRETRAIN_RUN,
-           PRETRAIN_EPOCHS, BATCH_SIZE, max_steps))
+           PRETRAIN_EPOCHS, BATCH_SIZE, max_steps, time_limit))
     rc = int(get_ipython().user_ns.get("_exit_code", 0) or 0)
     if rc:
         raise RuntimeError("splice pretraining exited with code %d - see the traceback above." % rc)
@@ -258,12 +261,13 @@ elif USE_PRETRAIN and Path(PRETRAIN_RUN, "state.pt").exists():
     init_from = "--init-from %s/state.pt" % PRETRAIN_RUN
 
 max_steps = "--max-steps %d" % MAX_STEPS if MAX_STEPS else ""
+time_limit = "--time-limit-h %g" % TIME_LIMIT_H if TIME_LIMIT_H else ""
 get_ipython().system(
     "torchrun --standalone --nproc_per_node=%d -m src.train.train_query "
     "--config configs/kaggle_query.yaml --data %s %s --out %s --fold %d "
-    "--epochs %d --batch-size %d %s %s %s"
+    "--epochs %d --batch-size %d %s %s %s %s"
     % (max(1, torch.cuda.device_count()), DATA, extra, RUN, FOLD,
-       EPOCHS, BATCH_SIZE, resume, init_from, max_steps))
+       EPOCHS, BATCH_SIZE, resume, init_from, max_steps, time_limit))
 
 rc = int(get_ipython().user_ns.get("_exit_code", 0) or 0)
 if rc:
@@ -272,10 +276,14 @@ if rc:
         "every rank prints its own copy, so read the *first* traceback block." % rc)
 '''),
 
-md("### If the session is about to time out\n\n"
-   "Kaggle sessions cap at ~12 h. `--time-limit-h` (add it to the cell above) "
-   "stops training after the last epoch that fits and leaves `state.pt` for "
-   "`--resume auto` in a later session, the same as the span model's notebook."),
+md("### If the session times out anyway\n\n"
+   "Kaggle sessions cap at ~12 h. Both training cells above already pass "
+   "`--time-limit-h` (`PRETRAIN_TIME_LIMIT_H` / `TIME_LIMIT_H` in CONFIG) for "
+   "the real run, so they stop cleanly after the last epoch that fits and "
+   "leave `state.pt` behind. If a session still gets killed mid-epoch (OOM, "
+   "quota, manual stop), set `RESUME_FROM` to that run's output directory "
+   "and re-run this cell - it copies the checkpoint in and passes "
+   "`--resume auto`, the same as the span model's notebook."),
 
 md("## 9. Find the evaluation audio"),
 

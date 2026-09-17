@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -79,8 +80,13 @@ def main() -> None:
 
     n_samp = int(args.clip_len * args.sr)
     written, man = 0, (out / "manifest.jsonl").open("w", encoding="utf-8")
+    MIN_FREE_BYTES = 2 * 1024**3
 
     for i in range(args.num):
+        if written % 500 == 0 and shutil.disk_usage(out).free < MIN_FREE_BYTES:
+            print("[splice] low disk space - stopping at %d clips (target was %d)"
+                  % (written, args.num), flush=True)
+            break
         host = rng.choice(hosts)
         try:
             hy = read_audio(data / host["path"], args.sr)

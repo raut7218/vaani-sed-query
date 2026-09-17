@@ -165,10 +165,23 @@ code('!pip -q install -r requirements.txt 2>&1 | tail -2\n'),
 md("## 2. Verify the wiring before spending GPU hours\n\n"
    "CPU, seconds: shape/finiteness checks, then the overfit proof that the "
    "query head is time-aligned to the audio (mirrors `test_overfit.py` for "
-   "the trident head)."),
+   "the trident head). Then a disk/credentials preflight - four separate "
+   "real runs of this pipeline each burned close to an hour before failing "
+   "on a missing HF_TOKEN or disk exhaustion; this catches both in seconds, "
+   "before anything downloads."),
 
 code('!python tests/test_query_components.py\n'
     '!python tests/test_query_overfit.py 2>&1 | tail -6\n'),
+
+code('get_ipython().system(\n'
+    '    "python scripts/preflight.py --work %s --data-from \'%s\' "\n'
+    '    "--max-shards %d --n-synthetic %d --n-pretrain %d --clip-len %g"\n'
+    '    % (WORK, DATA_FROM, MAX_SHARDS, N_SYNTHETIC if USE_SYNTHETIC else 0,\n'
+    '       N_PRETRAIN if USE_PRETRAIN else 0, 8.0))\n'
+    'rc = int(get_ipython().user_ns.get("_exit_code", 0) or 0)\n'
+    'if rc:\n'
+    '    raise RuntimeError("preflight failed - see the message above; fix it "\n'
+    '                       "before this burns another GPU session.")\n'),
 
 md("## 3. Encoders"),
 

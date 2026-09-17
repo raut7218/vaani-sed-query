@@ -158,6 +158,19 @@ def main() -> None:
         missing, unexpected = model.load_state_dict(st["model"], strict=False)
         log("[init-from] %s (missing %d, unexpected %d)"
             % (args.init_from, len(missing), len(unexpected)))
+        del st
+        if is_main():
+            # Once loaded, the pretrain run's checkpoints (~475MB: state.pt
+            # + best.pt) serve no further purpose - fine-tune has its own
+            # checkpoints from here. A real run measured only ~5GB free
+            # after data generation; this run's own disk footprint growing
+            # for hours (two checkpoint dirs, notebook output) ate that
+            # margin and hit ENOSPC mid-run. Reclaiming this now, right as
+            # the long fine-tune phase starts, is free and direct.
+            pretrain_dir = Path(args.init_from).parent
+            for f in ("state.pt", "best.pt"):
+                (pretrain_dir / f).unlink(missing_ok=True)
+            log("[init-from] freed %s" % pretrain_dir)
 
     crit = SetSpanLoss(cfg, int(m.get("n_bins", 16)))
     lr = float(t["lr"])
